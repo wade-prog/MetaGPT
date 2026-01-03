@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 from asyncio import Queue
 from asyncio.subprocess import PIPE, STDOUT
 from typing import Optional
@@ -21,9 +22,16 @@ class Terminal:
     to use the `execute_in_conda_env` method.
     """
 
-    def __init__(self):
-        self.shell_command = ["bash"]  # FIXME: should consider windows support later
+    def __init__(self, shell: Optional[str] = None):
+        self._shell_preference = (shell or os.getenv("METAGPT_SHELL") or "").strip().lower()
+        self.shell_command: list[str] = []
+        self.executable: Optional[str] = None
+        self.shell_flavor: str = ""
         self.command_terminator = "\n"
+        self._pwd_command = "pwd"
+        # End marker must be safe for the chosen shell.
+        # NOTE: END_MARKER_VALUE contains a newline (and control chars). That works in bash but breaks cmd.exe.
+        self._end_marker_value = END_MARKER_VALUE
         self.stdout_queue = Queue(maxsize=1000)
         self.observer = TerminalReporter()
         self.process: Optional[asyncio.subprocess.Process] = None
@@ -34,6 +42,99 @@ class Terminal:
             "serve ": "Use Deployer.deploy_to_public instead.",
         }
 
+        self._configure_shell()
+
+    def _configure_shell(self) -> None:
+        """Choose an interactive shell implementation per OS.
+
+        - Prefer bash on Unix.
+        - On Windows, prefer bash if available (Git Bash/WSL), otherwise fall back to cmd.exe.
+
+        Users can override with env var `METAGPT_SHELL` or constructor arg `shell`.
+        Supported values: bash, cmd.
+        """
+
+        def _which_any(*names: str) -> Optional[str]:
+            for name in names:
+                path = shutil.which(name)
+                if path:
+                    return path
+            return None
+
+        if os.name != "nt":
+            bash = _which_any("bash", "sh")
+            self.executable = bash or "bash"
+            self.shell_command = [self.executable]
+            self.shell_flavor = "bash"
+            self.command_terminator = "\n"
+            self._pwd_command = "pwd"
+            self._end_marker_value = END_MARKER_VALUE
+            return
+
+        # Windows
+        pref = self._shell_preference
+        bash = _which_any("bash")
+
+        if pref in {"bash", "sh"}:
+            if not bash:
+                raise FileNotFoundError(
+                    "METAGPT_SHELL=bash requested, but 'bash' was not found. "
+                    "Install Git for Windows (Git Bash) or enable WSL, or set METAGPT_SHELL=cmd."
+                )
+            self.executable = bash
+            self.shell_command = [bash]
+            self.shell_flavor = "bash"
+            self.command_terminator = "\n"
+            self._pwd_command = "pwd"
+            self._end_marker_value = END_MARKER_VALUE
+            return
+
+        if pref in {"cmd", "cmd.exe"}:
+            self.executable = _which_any("cmd.exe") or "cmd.exe"
+            # /Q: turn echo off, /K: keep the session running
+            self.shell_command = [self.executable, "/Q", "/K"]
+            self.shell_flavor = "cmd"
+            self.command_terminator = "\r\n"
+            self._pwd_command = "cd"
+            # cmd.exe cannot reliably echo control chars/newlines used by END_MARKER_VALUE.
+            self._end_marker_value = "__METAGPT_CMD_END__"
+            return
+
+        # Auto on Windows: prefer bash if available, else cmd.
+        if bash:
+            self.executable = bash
+            self.shell_command = [bash]
+            self.shell_flavor = "bash"
+            self.command_terminator = "\n"
+            self._pwd_command = "pwd"
+            self._end_marker_value = END_MARKER_VALUE
+        else:
+            self.executable = _which_any("cmd.exe") or "cmd.exe"
+            self.shell_command = [self.executable, "/Q", "/K"]
+            self.shell_flavor = "cmd"
+            self.command_terminator = "\r\n"
+            self._pwd_command = "cd"
+            self._end_marker_value = "__METAGPT_CMD_END__"
+
+    def _format_end_marker_command(self) -> str:
+        # In cmd.exe, the marker must not contain newline/control chars.
+        # Also, `echo "MARK"` prints quotes too. Use no quotes.
+        if self.shell_flavor == "cmd":
+            return f"echo {self._end_marker_value}"
+
+        # bash/sh: keep the existing marker (contains newline+control chars) to preserve behavior.
+        return f'echo "{self._end_marker_value}"'
+
+    def _compat_command(self, cmd: str) -> str:
+        """Best-effort compatibility for Windows cmd.exe when the agent emits POSIX-ish commands."""
+        if os.name != "nt" or self.shell_flavor != "cmd":
+            return cmd
+
+        # Common POSIX -> cmd translations.
+        cmd = re.sub(r"(?<!\S)pwd(?!\S)", "cd", cmd)
+        cmd = re.sub(r"(?<!\S)mkdir\s+-p\s+", "mkdir ", cmd)
+        return cmd
+
     async def _start_process(self):
         # Start a persistent shell process
         self.process = await asyncio.create_subprocess_exec(
@@ -41,7 +142,7 @@ class Terminal:
             stdin=PIPE,
             stdout=PIPE,
             stderr=STDOUT,
-            executable="bash",
+            executable=self.executable,
             env=os.environ.copy(),
             cwd=DEFAULT_WORKSPACE_ROOT.absolute(),
         )
@@ -51,7 +152,7 @@ class Terminal:
         """
         Check the state of the terminal, e.g. the current directory of the terminal process. Useful for agent to understand.
         """
-        output = await self.run_command("pwd")
+        output = await self.run_command(self._pwd_command)
         logger.info("The terminal is at:", output)
 
     async def run_command(self, cmd: str, daemon=False) -> str:
@@ -72,6 +173,9 @@ class Terminal:
             await self._start_process()
 
         output = ""
+
+        cmd = self._compat_command(cmd)
+
         # Remove forbidden commands
         commands = re.split(r"\s*&&\s*", cmd)
         for cmd_name, reason in self.forbidden_commands.items():
@@ -82,16 +186,23 @@ class Terminal:
                     commands[index] = "true"
         cmd = " && ".join(commands)
 
-        # Send the command
-        self.process.stdin.write((cmd + self.command_terminator).encode())
-        self.process.stdin.write(
-            f'echo "{END_MARKER_VALUE}"{self.command_terminator}'.encode()  # write EOF
-        )  # Unique marker to signal command end
-        await self.process.stdin.drain()
-        if daemon:
-            asyncio.create_task(self._read_and_process_output(cmd))
-        else:
-            output += await self._read_and_process_output(cmd)
+        try:
+            # Send the command
+            self.process.stdin.write((cmd + self.command_terminator).encode())
+            self.process.stdin.write(
+                f"{self._format_end_marker_command()}{self.command_terminator}".encode()  # write EOF
+            )  # Unique marker to signal command end
+            await self.process.stdin.drain()
+            if daemon:
+                asyncio.create_task(self._read_and_process_output(cmd))
+            else:
+                output += await self._read_and_process_output(cmd)
+        except asyncio.CancelledError:
+            # Best-effort cleanup so Ctrl+C doesn't leave subprocess transports dangling.
+            try:
+                await self.close()
+            finally:
+                raise
 
         return output
 
@@ -142,13 +253,17 @@ class Terminal:
             # '\r' is changed to '\n', resulting in excessive output.
             tmp = b""
             while True:
-                output = tmp + await self.process.stdout.read(1)
-                if not output:
-                    continue
+                chunk = await self.process.stdout.read(1)
+                if chunk == b"":
+                    # EOF: subprocess ended unexpectedly; avoid infinite loop.
+                    raise RuntimeError("Terminal subprocess ended unexpectedly (EOF).")
+
+                output = tmp + chunk
                 *lines, tmp = output.splitlines(True)
                 for line in lines:
-                    line = line.decode()
-                    ix = line.rfind(END_MARKER_VALUE)
+                    # Use a tolerant decode because Windows cmd output may not be UTF-8.
+                    line = line.decode(errors="replace")
+                    ix = line.rfind(self._end_marker_value)
                     if ix >= 0:
                         line = line[0:ix]
                         if line:
@@ -178,7 +293,7 @@ class Bash(Terminal):
     def __init__(self):
         """init"""
         os.environ["SWE_CMD_WORK_DIR"] = str(Config.default().workspace.path)
-        super().__init__()
+        super().__init__(shell="bash")
         self.start_flag = False
 
     async def start(self):

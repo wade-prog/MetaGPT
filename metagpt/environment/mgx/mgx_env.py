@@ -68,7 +68,11 @@ class MGXEnv(Environment, SerializationMixin):
 
     async def reply_to_human(self, content: str, sent_from: Role = None) -> str:
         # NOTE: Can be overwritten in remote setting
-        return "SUCCESS, human has received your reply. Refrain from resending duplicate messages.  If you no longer need to take action, use the command ‘end’ to stop."
+        return (
+            "SUCCESS, human has received your reply. Refrain from resending duplicate messages. "
+            "In local CLI mode, the program will continue running until the team finishes or rounds are exhausted; "
+            "use Ctrl+C to interrupt if needed."
+        )
 
     def move_message_info_to_content(self, message: Message) -> Message:
         """Two things here:
